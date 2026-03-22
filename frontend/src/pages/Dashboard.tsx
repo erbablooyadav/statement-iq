@@ -7,6 +7,13 @@ import {
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
+interface SmartSwipeRec {
+  category: string;
+  cardName: string;
+  benefitDescription: string;
+  potentialSaving: string;
+}
+
 export default function Dashboard() {
   const { user, getToken } = useAuth();
   const [loading, setLoading] = useState(true);
@@ -17,6 +24,7 @@ export default function Dashboard() {
     totalSaved: 0,
     unreadAlerts: 0
   });
+  const [swipeRecs, setSwipeRecs] = useState<SmartSwipeRec[]>([]);
 
   useEffect(() => {
     fetchSummary();
@@ -25,14 +33,16 @@ export default function Dashboard() {
   const fetchSummary = async () => {
     try {
       const token = await getToken();
-      const res = await apiClient.get('/dashboard/summary', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (res.data.success) {
-        setSummary(res.data.data);
+      const [summaryRes, swipeRes] = await Promise.all([
+        apiClient.get('/dashboard/summary', { headers: { Authorization: `Bearer ${token}` } }),
+        apiClient.get('/smart-swipe', { headers: { Authorization: `Bearer ${token}` } })
+      ]);
+      if (summaryRes.data.success) setSummary(summaryRes.data.data);
+      if (swipeRes.data.success && swipeRes.data.data?.recommendations) {
+        setSwipeRecs(swipeRes.data.data.recommendations);
       }
     } catch (e) {
-      console.error('Failed to fetch dashboard summary', e);
+      console.error('Failed to fetch dashboard data', e);
     }
     setLoading(false);
   };
@@ -83,11 +93,16 @@ export default function Dashboard() {
         <div className="flex items-center gap-2 mb-4">
           <CreditCard className="w-5 h-5" style={{ color: 'var(--color-brand-400)' }} />
           <h2 className="font-bold">Smart Swipe — Today's Best Cards</h2>
+          <span className="ml-auto text-xs px-2 py-0.5 rounded-full font-semibold" style={{ background: 'var(--color-bg-elevated)', color: 'var(--color-brand-400)' }}>AI-Powered</span>
         </div>
         <div className="space-y-3">
-          <CardRecommendation category="Groceries" card="ICICI Amazon Pay" benefit="5% cashback" saving="₹100" />
-          <CardRecommendation category="Food Delivery" card="Axis Ace" benefit="5% cashback" saving="₹25" />
-          <CardRecommendation category="Travel" card="HDFC Regalia" benefit="4X points" saving="₹200" />
+          {swipeRecs.length > 0 ? (
+            swipeRecs.map((rec, i) => (
+              <CardRecommendation key={i} category={rec.category} card={rec.cardName} benefit={rec.benefitDescription} saving={rec.potentialSaving} />
+            ))
+          ) : (
+            <p className="text-sm text-center py-4" style={{ color: 'var(--color-text-muted)' }}>Upload a statement to get personalized card recommendations.</p>
+          )}
         </div>
       </div>
 
