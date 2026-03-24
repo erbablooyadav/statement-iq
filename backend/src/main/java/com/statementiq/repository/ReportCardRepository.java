@@ -9,6 +9,6 @@ import java.util.Optional;
 
 @Repository
 public interface ReportCardRepository extends MongoRepository<ReportCard, String> {
-    Optional<ReportCard> findByUserIdAndReportMonth(String userId, String reportMonth);
-    List<ReportCard> findByUserIdOrderByReportMonthDesc(String userId);
+    List<ReportCard> findByUserIdOrderByMonthDesc(String userId);
+    Optional<ReportCard> findByUserIdAndMonth(String userId, String month);
 }

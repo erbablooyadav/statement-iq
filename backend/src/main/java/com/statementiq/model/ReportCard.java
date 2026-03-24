@@ -5,18 +5,19 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
+import java.math.BigDecimal;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
 @Document(collection = "report_cards")
+@CompoundIndex(def = "{'userId': 1, 'month': 1}", unique = true)
 public class ReportCard {
 
     @Id
@@ -25,29 +26,25 @@ public class ReportCard {
     @Indexed
     private String userId;
 
-    private String reportMonth;          // "2025-03"
+    /** Month in "yyyy-MM" format */
+    private String month;
 
-    private int spendControlScore;       // 0-100
-    private int savingsRateScore;
-    private int rewardOptimizationScore;
-    private int hiddenChargesScore;
-    private int goalProgressScore;
+    /** Overall financial health score (0-100) */
     private int overallScore;
 
-    private String spendControlGrade;    // A+, A, B+, B, C, D, F
-    private String savingsRateGrade;
-    private String rewardOptimizationGrade;
-    private String hiddenChargesGrade;
-    private String goalProgressGrade;
-    private String overallGrade;
+    private int savingsScore;       // Did they save? (0-100)
+    private int spendControlScore;  // Spending within limits? (0-100)
+    private int hiddenChargeScore;  // Zero hidden fees = 100 (0-100)
+    private int goalAdherenceScore; // Goal progress this month? (0-100)
 
-    private int scoreChangeFromLastMonth;
+    private BigDecimal totalIncome;
+    private BigDecimal totalSpent;
+    private BigDecimal totalSaved;
+    private int transactionCount;
 
-    @Builder.Default
-    private List<String> highlights = new ArrayList<>();
-
-    @Builder.Default
-    private List<String> opportunities = new ArrayList<>();
+    private String topCategory;
+    private String badge;          // "Saver 💰", "Overspender 🔥", "Streak Master 🏆", etc.
+    private String aiNarrative;    // 2-3 sentence summary
 
     private Instant generatedAt;
 }

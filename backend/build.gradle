@@ -41,6 +41,7 @@ dependencies {
 
 	// JSON Processing
 	implementation 'com.google.code.gson:gson:2.12.1'
+	implementation 'org.json:json:20240303'
 
 	// HTTP Client for Claude API
 	implementation 'org.springframework.boot:spring-boot-starter-webflux'

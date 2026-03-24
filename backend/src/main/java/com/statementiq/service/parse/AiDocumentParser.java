@@ -12,11 +12,14 @@ import com.statementiq.service.ai.AiProviderRouter;
 import com.statementiq.service.domain.UserService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.time.LocalDate;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
 /**
@@ -28,7 +31,7 @@ import java.util.stream.Collectors;
 public class AiDocumentParser {
 
     private static final Logger log = LoggerFactory.getLogger(AiDocumentParser.class);
-    private static final int MAX_CHARS_PER_CHUNK = 2000;
+    private static final int MAX_CHARS_PER_CHUNK = 50000;
     private static final int MAX_OUTPUT_TOKENS = 16384;
     private static final String SYSTEM_PROMPT =
             "You are an expert financial data extraction system. You must output ONLY RAW JSON. No markdown, no conversational text.";
@@ -36,16 +39,21 @@ public class AiDocumentParser {
     private final AiProviderRouter aiProviderRouter;
     private final UserService userService;
     private final Gson gson;
+    private final Executor pdfProcessingExecutor;
 
-    public AiDocumentParser(AiProviderRouter aiProviderRouter, UserService userService) {
+    public AiDocumentParser(AiProviderRouter aiProviderRouter,
+                            UserService userService,
+                            @Qualifier("pdfProcessingExecutor") Executor pdfProcessingExecutor) {
         this.aiProviderRouter = aiProviderRouter;
         this.userService = userService;
+        this.pdfProcessingExecutor = pdfProcessingExecutor;
         this.gson = new GsonBuilder()
                 .registerTypeAdapter(LocalDate.class, new TypeAdapter<LocalDate>() {
                     @Override
                     public void write(JsonWriter out, LocalDate value) throws IOException {
                         out.value(value != null ? value.toString() : null);
                     }
+
                     @Override
                     public LocalDate read(JsonReader in) throws IOException {
                         if (in.peek() == com.google.gson.stream.JsonToken.NULL) {
@@ -60,6 +68,7 @@ public class AiDocumentParser {
 
     /**
      * Parse statement using chunked page-level processing.
+     *
      * @param pages List of page texts extracted from the PDF
      */
     public ParseResult parse(List<String> pages, Statement.StatementType type, String bankName, String userId,
@@ -70,30 +79,45 @@ public class AiDocumentParser {
         log.info("Processing {} pages in {} chunks for user={}", pages.size(), chunks.size(), userId);
 
         if (chunks.size() == 1) {
-            // Single chunk — simple path, no merging needed
             String chunkText = String.join("\n", chunks.get(0));
             ParseResult result = parseSingleChunk(chunkText, type, bankName, user, 1, 1);
             if (progressCallback != null) progressCallback.accept(1, 1);
             return result;
         }
 
-        // Multi-chunk — process each, then merge
+        // PARALLEL chunk processing — all chunks fire simultaneously
+        List<CompletableFuture<ParseResult>> futures = new ArrayList<>();
+        int totalChunks = chunks.size();
+
+        for (int i = 0; i < totalChunks; i++) {
+            final String chunkText = String.join("\n", chunks.get(i));
+            final int chunkIndex = i + 1;
+
+            CompletableFuture<ParseResult> future = CompletableFuture
+                    .supplyAsync(() -> {
+                        try {
+                            return parseSingleChunk(chunkText, type, bankName, user, chunkIndex, totalChunks);
+                        } catch (Exception e) {
+                            log.warn("Chunk {}/{} failed: {}. Returning empty result.", chunkIndex, totalChunks, e.getMessage());
+                            return null; // handled in merge step
+                        }
+                    }, pdfProcessingExecutor);
+
+            futures.add(future);
+        }
+
+        // Wait for ALL chunks to complete simultaneously
         List<ParseResult> chunkResults = new ArrayList<>();
-        for (int i = 0; i < chunks.size(); i++) {
-            String chunkText = String.join("\n", chunks.get(i));
+        for (int i = 0; i < futures.size(); i++) {
             try {
-                ParseResult result = parseSingleChunk(chunkText, type, bankName, user, i + 1, chunks.size());
-                if (result != null && result.getTransactions() != null) {
+                ParseResult result = futures.get(i).get(60, java.util.concurrent.TimeUnit.SECONDS);
+                if (result != null && result.getTransactions() != null && !result.getTransactions().isEmpty()) {
                     chunkResults.add(result);
-                    log.info("Chunk {}/{}: extracted {} transactions",
-                            i + 1, chunks.size(), result.getTransactions().size());
+                    log.info("Chunk {}/{}: extracted {} transactions", i + 1, totalChunks, result.getTransactions().size());
                 }
+                if (progressCallback != null) progressCallback.accept(i + 1, totalChunks);
             } catch (Exception e) {
-                log.warn("Chunk {}/{} failed: {}. Continuing with remaining chunks.",
-                        i + 1, chunks.size(), e.getMessage());
-            }
-            if (progressCallback != null) {
-                progressCallback.accept(i + 1, chunks.size());
+                log.warn("Chunk {}/{} timed out or failed: {}", i + 1, totalChunks, e.getMessage());
             }
         }
 
@@ -149,8 +173,8 @@ public class AiDocumentParser {
     // ─── Single Chunk AI Call ─────────────────────────────────
 
     private ParseResult parseSingleChunk(String chunkText, Statement.StatementType type,
-                                          String bankName, User user,
-                                          int chunkIndex, int totalChunks) {
+                                         String bankName, User user,
+                                         int chunkIndex, int totalChunks) {
         String prompt = buildPrompt(chunkText, type, bankName, chunkIndex, totalChunks);
 
         AiResponse response = aiProviderRouter.route(SYSTEM_PROMPT, prompt, user, MAX_OUTPUT_TOKENS);
@@ -233,8 +257,8 @@ public class AiDocumentParser {
 
         for (RawTransaction tx : transactions) {
             String key = (tx.getDate() != null ? tx.getDate().toString() : "null") + "|" +
-                         (tx.getAmount() != null ? tx.getAmount().toPlainString() : "null") + "|" +
-                         (tx.getRawDescription() != null ? tx.getRawDescription().trim().toLowerCase() : "null");
+                    (tx.getAmount() != null ? tx.getAmount().toPlainString() : "null") + "|" +
+                    (tx.getRawDescription() != null ? tx.getRawDescription().trim().toLowerCase() : "null");
             if (seen.add(key)) {
                 unique.add(tx);
             }
@@ -248,50 +272,50 @@ public class AiDocumentParser {
                                int chunkIndex, int totalChunks) {
         String chunkInfo = totalChunks > 1
                 ? "This is part " + chunkIndex + " of " + totalChunks + " of the statement. " +
-                  "Extract ONLY the transactions visible in this part. Do NOT invent or guess missing transactions.\n\n"
+                "Extract ONLY the transactions visible in this part. Do NOT invent or guess missing transactions.\n\n"
                 : "";
 
         return chunkInfo +
-               "Extract all financial transactions from the following bank statement text. " +
-               "This is a " + type.name() + " statement from " + bankName + ".\n\n" +
-               "RULES:\n" +
-               "1. Extract EVERY SINGLE transaction visible in this text. Do not miss any.\n" +
-               "2. Clean up 'rawDescription' into a concise 'merchantName' (e.g. 'UPI/Paytm/Swiggy' -> 'Swiggy') and a readable 'description'.\n" +
-               "3. Classify the transaction into ONE of these categories: Housing, Transportation, Food & Dining, Utilities, Healthcare, Insurance, Personal, Education, Debt, Saving & Investing, Income, Miscellaneous.\n" +
-               "4. Detect if it's a fee (isFee), EMI (isEmi), subscription (isRecurring), ATM withdrawal (isAtmWithdrawal), or salary (isSalaryCredit).\n" +
-               "5. Output valid JSON exactly matching this structure (no extra keys, no missing required fields):\n" +
-               "{\n" +
-               "  \"confidence\": 0.95,\n" +
-               "  \"statementMonth\": \"2023-10\",\n" +
-               "  \"billDueDate\": \"2023-11-05\", // YYYY-MM-DD, null if not applicable or not visible in this part\n" +
-               "  \"totalAmountDue\": 10500.50, // null if not applicable or not visible in this part\n" +
-               "  \"minimumAmountDue\": 500.00, // null if not applicable or not visible in this part\n" +
-               "  \"transactions\": [\n" +
-               "    {\n" +
-               "       \"date\": \"YYYY-MM-DD\",\n" +
-               "       \"rawDescription\": \"original raw line\",\n" +
-               "       \"merchantName\": \"Clean Name\",\n" +
-               "       \"description\": \"Human readable description\",\n" +
-               "       \"amount\": 450.00,\n" +
-               "       \"type\": \"DEBIT\", // or CREDIT\n" +
-               "       \"channel\": \"UPI\", // UPI, POS, NEFT, ATM, etc\n" +
-               "       \"closingBalance\": 10500.00, // running balance if present\n" +
-               "       \"category\": \"Food & Dining\",\n" +
-               "       \"subCategory\": \"Delivery\",\n" +
-               "       \"isFee\": false,\n" +
-               "       \"isEmi\": false,\n" +
-               "       \"isRecurring\": false,\n" +
-               "       \"isAtmWithdrawal\": false,\n" +
-               "       \"isSalaryCredit\": false\n" +
-               "    }\n" +
-               "  ]\n" +
-               "}\n\n" +
-               "IMPORTANT: Ensure your output is purely the JSON object, absolutely zero additional conversational text. If there are no transactions in this part, return an empty array for transactions.\n\n" +
-               "STATEMENT TEXT START:\n" +
-               "=====================\n" +
-               rawText + "\n" +
-               "=====================\n" +
-               "STATEMENT TEXT END\n";
+                "Extract all financial transactions from the following bank statement text. " +
+                "This is a " + type.name() + " statement from " + bankName + ".\n\n" +
+                "RULES:\n" +
+                "1. Extract EVERY SINGLE transaction visible in this text. Do not miss any.\n" +
+                "2. Clean up 'rawDescription' into a concise 'merchantName' (e.g. 'UPI/Paytm/Swiggy' -> 'Swiggy') and a readable 'description'.\n" +
+                "3. Classify the transaction into ONE of these categories: Housing, Transportation, Food & Dining, Utilities, Healthcare, Insurance, Personal, Education, Debt, Saving & Investing, Income, Miscellaneous.\n" +
+                "4. Detect if it's a fee (isFee), EMI (isEmi), subscription (isRecurring), ATM withdrawal (isAtmWithdrawal), or salary (isSalaryCredit).\n" +
+                "5. Output valid JSON exactly matching this structure (no extra keys, no missing required fields):\n" +
+                "{\n" +
+                "  \"confidence\": 0.95,\n" +
+                "  \"statementMonth\": \"2023-10\",\n" +
+                "  \"billDueDate\": \"2023-11-05\", // YYYY-MM-DD, null if not applicable or not visible in this part\n" +
+                "  \"totalAmountDue\": 10500.50, // null if not applicable or not visible in this part\n" +
+                "  \"minimumAmountDue\": 500.00, // null if not applicable or not visible in this part\n" +
+                "  \"transactions\": [\n" +
+                "    {\n" +
+                "       \"date\": \"YYYY-MM-DD\",\n" +
+                "       \"rawDescription\": \"original raw line\",\n" +
+                "       \"merchantName\": \"Clean Name\",\n" +
+                "       \"description\": \"Human readable description\",\n" +
+                "       \"amount\": 450.00,\n" +
+                "       \"type\": \"DEBIT\", // or CREDIT\n" +
+                "       \"channel\": \"UPI\", // UPI, POS, NEFT, ATM, etc\n" +
+                "       \"closingBalance\": 10500.00, // running balance if present\n" +
+                "       \"category\": \"Food & Dining\",\n" +
+                "       \"subCategory\": \"Delivery\",\n" +
+                "       \"isFee\": false,\n" +
+                "       \"isEmi\": false,\n" +
+                "       \"isRecurring\": false,\n" +
+                "       \"isAtmWithdrawal\": false,\n" +
+                "       \"isSalaryCredit\": false\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}\n\n" +
+                "IMPORTANT: Ensure your output is purely the JSON object, absolutely zero additional conversational text. If there are no transactions in this part, return an empty array for transactions.\n\n" +
+                "STATEMENT TEXT START:\n" +
+                "=====================\n" +
+                rawText + "\n" +
+                "=====================\n" +
+                "STATEMENT TEXT END\n";
     }
 }
 
